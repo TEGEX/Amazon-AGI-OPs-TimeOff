@@ -11,8 +11,8 @@
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/TEGEX/Amazon-AGI-OPs-Checkin-Enhance/refs/heads/main/scripts
-// @downloadURL  https://raw.githubusercontent.com/TEGEX/Amazon-AGI-OPs-Checkin-Enhance/refs/heads/main/scripts
+// @updateURL    https://raw.githubusercontent.com/TEGEX/Amazon-AGI-OPs-TimeOff/refs/heads/main/scripts
+// @downloadURL  https://raw.githubusercontent.com/TEGEX/Amazon-AGI-OPs-TimeOff/refs/heads/main/scripts
 // ==/UserScript==
 //
 // NOTE: The Ops Portal my-day table is served inside an iframe from
