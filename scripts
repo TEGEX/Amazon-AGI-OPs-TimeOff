@@ -1,0 +1,572 @@
+// ==UserScript==
+// @name         AtoZ Time-Off on Ops Portal
+// @namespace    https://ads.opsportal.annotation.amazon.dev/
+// @version      1.0.0
+// @description  Scrape DA time-off requests from AtoZ manager view and show them as an extra column on the Ops Portal my-day time-off approval table (matched by alias). Shows N/A when there is no matching AtoZ request.
+// @author       gexu
+// @match        https://atoz.amazon.work/timecard/managerView*
+// @match        https://ads.opsportal.annotation.amazon.dev/app/my-day*
+// @match        https://my-day.products.annotation.amazon.dev/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/TEGEX/Amazon-AGI-OPs-Checkin-Enhance/refs/heads/main/scripts
+// @downloadURL  https://raw.githubusercontent.com/TEGEX/Amazon-AGI-OPs-Checkin-Enhance/refs/heads/main/scripts
+// ==/UserScript==
+//
+// NOTE: The Ops Portal my-day table is served inside an iframe from
+// my-day.products.annotation.amazon.dev (the ads.opsportal.* page is only a
+// shell). So we match that inner origin and must NOT use @noframes.
+
+/*
+ * ARCHITECTURE
+ * ------------
+ * One script, two @match targets. Tampermonkey shares GM_setValue storage across
+ * both, so the AtoZ side writes and the Ops Portal side reads. They are joined by
+ * the associate's login alias (e.g. "jaspesha"), which appears on both pages.
+ *
+ * Workflow (unchanged from what you do today):
+ *   1. Open the AtoZ manager view, set your date range / filters so the requests
+ *      table loads. The collector captures every visible row automatically.
+ *   2. Open (or refresh) the Ops Portal my-day page. Each time-off row gets a new
+ *      "AtoZ Request" column showing the matched AtoZ request, or N/A.
+ *
+ * The Ops Portal side also live-updates: if the AtoZ tab captures new data while
+ * the Ops Portal tab is open, the column refreshes via GM_addValueChangeListener.
+ */
+
+(function () {
+  'use strict';
+
+  const STORAGE_KEY = 'atoz_timeoff_by_alias_v1';
+  const host = location.hostname;
+
+  // Set to false to silence logging once everything works.
+  const DEBUG = true;
+  const log = (...a) => DEBUG && console.log('%c[AtoZ↔Ops]', 'color:#ff9900;font-weight:bold', ...a);
+
+  // ---------------------------------------------------------------------------
+  // Shared helpers
+  // ---------------------------------------------------------------------------
+  const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
+
+  function debounce(fn, ms) {
+    let t;
+    return function (...args) {
+      clearTimeout(t);
+      t = setTimeout(() => fn.apply(this, args), ms);
+    };
+  }
+
+  // ===========================================================================
+  // PART 1 — AtoZ collector  (atoz.amazon.work/timecard/managerView)
+  // ===========================================================================
+  function runAtozCollector() {
+    // Columns in the StencilTable row, by <td> index:
+    //   0 Employee (alias + full name + employeeId)
+    //   1 Type      (e.g. Vacation)
+    //   2 Request   (e.g. "Wed, Sep 23, 2026, 9:30 AM - 2:00 PM")
+    //   3 Duration  (e.g. "4.50 hours")
+    //   4 Submitted (e.g. "9/17/2026, 12:39 PM")
+    //   5 Status    (e.g. "Approved")
+    function scrapeRow(tr) {
+      const cells = tr.querySelectorAll(':scope > td');
+      if (!cells.length) return null;
+
+      // Alias comes from the phonetool link — the most stable anchor available.
+      const phone = tr.querySelector('a[href*="phonetool.amazon.com/users/"]');
+      let alias = '';
+      if (phone) {
+        const m = phone.getAttribute('href').match(/users\/([^/?#]+)/);
+        if (m) alias = decodeURIComponent(m[1]).toLowerCase();
+      }
+      if (!alias) {
+        // Fallback: "jaspesha@" text in the username slot.
+        const uname = tr.querySelector('[data-test-component="AvatarUsername"]');
+        if (uname) alias = text(uname).replace(/@.*$/, '').toLowerCase();
+      }
+      if (!alias) return null;
+
+      const fullName = text(tr.querySelector('[data-test-component="AvatarFullname"]'));
+
+      // employeeId lives inside the Avatar text line (label "employeeId").
+      let employeeId = '';
+      const idRow = tr.querySelector('[data-test-component="AvatarTextLine"]');
+      if (idRow) {
+        const m = text(idRow).match(/(\d{6,})/);
+        if (m) employeeId = m[1];
+      }
+
+      const cellText = (i) => text(cells[i]);
+
+      return {
+        alias,
+        fullName,
+        employeeId,
+        type: cellText(1),
+        request: cellText(2),
+        duration: cellText(3),
+        submitted: cellText(4),
+        status: cellText(5),
+      };
+    }
+
+    function scrapeAll() {
+      const rows = document.querySelectorAll('tr[data-test-component="StencilTableRow"]');
+      log('AtoZ: found', rows.length, 'StencilTableRow element(s)');
+      const byAlias = {};
+      rows.forEach((tr) => {
+        const rec = scrapeRow(tr);
+        if (!rec) {
+          log('AtoZ: skipped a row (no alias found). Row text:', text(tr).slice(0, 80));
+          return;
+        }
+        // One alias can have multiple requests — keep them all in a list.
+        (byAlias[rec.alias] = byAlias[rec.alias] || []).push(rec);
+      });
+      return byAlias;
+    }
+
+    // Auto-capture: whenever the requests table changes (you set/change the date
+    // range and it re-renders), scrape and store. To avoid a write loop from the
+    // SPA's constant DOM churn, only store when the scraped data actually changed.
+    let lastSignature = '';
+    const capture = debounce(() => {
+      const data = scrapeAll();
+      const count = Object.keys(data).length;
+      if (count === 0) return; // don't clobber good data with an empty scrape mid-render
+
+      const signature = JSON.stringify(data);
+      if (signature === lastSignature) return; // unchanged — skip
+      lastSignature = signature;
+
+      GM_setValue(STORAGE_KEY, {
+        capturedAt: Date.now(),
+        capturedFrom: location.href,
+        byAlias: data,
+      });
+      log('AtoZ: auto-captured', count, 'associate(s):', data);
+    }, 800);
+
+    // Watch for table renders (initial load + every date-range change).
+    const mo = new MutationObserver(capture);
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+    capture(); // initial attempt
+  }
+
+  // ===========================================================================
+  // PART 2 — Ops Portal display  (ads.opsportal.annotation.amazon.dev/app/my-day)
+  // ===========================================================================
+  function runOpsPortalDisplay() {
+    const NEW_COL_ID = 'atoz-request-col';
+    const NEW_CELL_CLASS = 'atoz-request-cell';
+
+    function getStore() {
+      const raw = GM_getValue(STORAGE_KEY, null);
+      return raw && raw.byAlias ? raw : null;
+    }
+
+    // Locate the time-off table. Primary: the header with data-focus-id.
+    // Fallback: any table whose headers include "Associate" + a time-off/details column.
+    function findTable() {
+      // Primary anchor.
+      let th = document.querySelector('th[data-focus-id="header-userAlias"]');
+      if (th && th.closest('table')) return th.closest('table');
+
+      // Fallback: scan every table's headers by visible text.
+      const tables = document.querySelectorAll('table');
+      for (const table of tables) {
+        const headerTexts = Array.from(table.querySelectorAll('thead th, thead td'))
+          .map((c) => text(c).toLowerCase());
+        const hasAssociate = headerTexts.some((t) => t.includes('associate'));
+        const hasDetails = headerTexts.some(
+          (t) => t.includes('time-off') || t.includes('time off') || t.includes('npt')
+        );
+        if (hasAssociate && hasDetails) {
+          log('Ops: found table via header-text fallback. Headers:', headerTexts);
+          return table;
+        }
+      }
+      return null;
+    }
+
+    // Find the index of the Associate and Details columns.
+    // Primary: data-focus-id. Fallback: header text.
+    function columnIndexes(table) {
+      const ths = Array.from(table.querySelectorAll('thead th, thead td'));
+      let aliasIdx = -1;
+      let detailsIdx = -1;
+
+      ths.forEach((th, i) => {
+        const fid = th.getAttribute('data-focus-id') || '';
+        if (fid === 'header-userAlias') aliasIdx = i;
+        if (fid === 'header-duration') detailsIdx = i; // "Time-off or NPT details"
+      });
+
+      // Fallback to header text if focus-ids are absent.
+      if (aliasIdx < 0 || detailsIdx < 0) {
+        ths.forEach((th, i) => {
+          const t = text(th).toLowerCase();
+          if (aliasIdx < 0 && t.includes('associate')) aliasIdx = i;
+          if (
+            detailsIdx < 0 &&
+            (t.includes('time-off') || t.includes('time off') || t.includes('npt'))
+          ) {
+            detailsIdx = i;
+          }
+        });
+      }
+      return { aliasIdx, detailsIdx, colCount: ths.length };
+    }
+
+    function formatMatch(records, opsDetails) {
+      if (!records || !records.length) return null;
+
+      // Date-only matching: show an AtoZ request ONLY if the associate has one on
+      // the same calendar date as the ops-portal row. Otherwise return null (N/A).
+      // (Times are intentionally not compared — the two systems report different
+      // clock times for the same request due to a timezone offset.)
+      const opsDate = (opsDetails.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
+      if (!opsDate) return null; // no date to match against
+
+      const chosen = records.filter((r) => atozDateToISO(r.request) === opsDate);
+      if (!chosen.length) return null; // no AtoZ request on that date -> N/A
+
+      return chosen
+        .map((r) => {
+          const code = abbrevType(r.type);
+          const when = compactWhen(r.request); // "Sep 23, 9:30 AM - 2:00 PM"
+          const dur = (r.duration || '').replace(/\s*hours?/i, 'h').replace(/\s+/g, '');
+          const parts = [code, when, dur].filter(Boolean);
+          return parts.join(' · ');
+        })
+        .join('  |  ');
+    }
+
+    // Vacation -> V, Personal Time (Off) -> P, Sick -> S, etc.
+    function abbrevType(type) {
+      if (!type) return '?';
+      const t = type.toLowerCase();
+      if (t.includes('vacation')) return 'V';
+      if (t.includes('personal')) return 'P';
+      if (t.includes('sick')) return 'S';
+      if (t.includes('holiday')) return 'H';
+      if (t.includes('bereave')) return 'B';
+      if (t.includes('jury')) return 'J';
+      // Fallback: first letter, uppercased.
+      return type.trim().charAt(0).toUpperCase();
+    }
+
+    // "Wed, Sep 23, 2026, 9:30 AM - 2:00 PM" -> "Sep 23, 9:30 AM - 2:00 PM"
+    // Drops the leading weekday and the year to save width.
+    function compactWhen(request) {
+      if (!request) return '';
+      return request
+        .replace(/^[A-Za-z]{3,9},\s*/, '') // strip "Wed, "
+        .replace(/,\s*\d{4}/, '')          // strip ", 2026"
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    // Convert AtoZ "Wed, Sep 23, 2026, 9:30 AM - 2:00 PM" -> "2026-09-23"
+    function atozDateToISO(request) {
+      if (!request) return '';
+      const m = request.match(/([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})/);
+      if (!m) return '';
+      const months = {
+        jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+        jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+      };
+      const mm = months[m[1].slice(0, 3).toLowerCase()];
+      if (!mm) return '';
+      return `${m[3]}-${mm}-${String(m[2]).padStart(2, '0')}`;
+    }
+
+    function ensureHeaderCell(table) {
+      const headRow = table.querySelector('thead tr');
+      if (!headRow) return;
+      if (headRow.querySelector('#' + NEW_COL_ID)) return;
+
+      // Clone an existing header cell to inherit Cloudscape styling, then strip
+      // the interactive/sorting bits and set our label. Prefer a sortable header;
+      // fall back to the last <th>.
+      const allTh = headRow.querySelectorAll('th');
+      const template =
+        headRow.querySelector('th[data-focus-id="header-status"]') ||
+        allTh[allTh.length - 1] ||
+        null;
+      const th = template ? template.cloneNode(true) : document.createElement('th');
+      th.id = NEW_COL_ID;
+      th.removeAttribute('data-focus-id');
+      th.removeAttribute('aria-sort');
+      th.setAttribute('scope', 'col');
+      // Remove resizer/sorting internals from the clone if present.
+      th.querySelectorAll('.awsui_resizer-wrapper_x7peu_igrrf_14, .awsui_sorting-icon_1spae_18g9t_139')
+        .forEach((n) => n.remove());
+      const label = th.querySelector('.awsui_header-cell-text_1spae_18g9t_270');
+      if (label) {
+        label.textContent = 'AtoZ Request';
+      } else {
+        th.textContent = 'AtoZ Request';
+      }
+      headRow.appendChild(th);
+    }
+
+    // Find the Paycode column index from the header (focus-id or text).
+    function paycodeIndex(table) {
+      const ths = Array.from(table.querySelectorAll('thead th, thead td'));
+      let idx = ths.findIndex(
+        (th) => (th.getAttribute('data-focus-id') || '') === 'header-paycode'
+      );
+      if (idx < 0) {
+        idx = ths.findIndex((th) => text(th).toLowerCase() === 'paycode');
+      }
+      return idx;
+    }
+
+    // Hide the Paycode column (header + each body row's cell at that index) to
+    // free up horizontal space for the AtoZ Request column.
+    function hidePaycodeColumn(table, bodyRows) {
+      const idx = paycodeIndex(table);
+      if (idx < 0) return;
+      const headCells = table.querySelectorAll('thead th, thead td');
+      if (headCells[idx]) headCells[idx].style.display = 'none';
+      bodyRows.forEach((tr) => {
+        const cells = tr.querySelectorAll(':scope > td');
+        if (cells[idx]) cells[idx].style.display = 'none';
+      });
+    }
+
+    function decorate() {
+      const table = findTable();
+      if (!table) {
+        // Quiet: this fires repeatedly while the SPA is still rendering.
+        return;
+      }
+      log('Ops: table located.');
+      const store = getStore();
+      log('Ops: store from GM_getValue =', store);
+
+      ensureHeaderCell(table);
+
+      const { aliasIdx, detailsIdx, colCount } = columnIndexes(table);
+      log('Ops: aliasIdx=', aliasIdx, 'detailsIdx=', detailsIdx, 'colCount=', colCount);
+      if (aliasIdx < 0) {
+        log('Ops: could not locate Associate column, aborting.');
+        return;
+      }
+
+      // Body rows. Cloudscape sometimes splits the sticky header and the
+      // scrollable body into SEPARATE <table> elements, so the rows may not be
+      // inside `table`. Strategy:
+      //   1) rows with data-selection-item (same table)
+      //   2) rows inside the header table that have <td>
+      //   3) document-wide: any <tr> that contains a body-cell <td>, matching the
+      //      header's column count (so we don't grab unrelated tables)
+      let bodyRows = Array.from(
+        table.querySelectorAll('tbody tr[data-selection-item="item"]')
+      );
+      if (!bodyRows.length) {
+        bodyRows = Array.from(table.querySelectorAll('tr')).filter((tr) =>
+          tr.querySelector(':scope > td')
+        );
+      }
+      if (!bodyRows.length) {
+        const allRows = Array.from(document.querySelectorAll('tr')).filter((tr) =>
+          tr.querySelector(':scope > td[class*="body-cell"], :scope > td')
+        );
+        // Keep rows whose cell count is close to the header count (colCount-1,
+        // since we already appended our header cell).
+        bodyRows = allRows.filter((tr) => {
+          const n = tr.querySelectorAll(':scope > td').length;
+          return n >= colCount - 2; // tolerate our added column / minor variance
+        });
+        log('Ops: document-wide row search found', bodyRows.length,
+            'row(s) (of', allRows.length, 'candidate <tr> with <td>)');
+      } else {
+        log('Ops: found', bodyRows.length, 'body row(s)');
+      }
+
+      // Hide Paycode to make room for the AtoZ Request column.
+      hidePaycodeColumn(table, bodyRows);
+
+      // Track which AtoZ entries (alias + date) get matched to an ops row, so we
+      // can list the leftovers (AtoZ requests with no ops-portal counterpart).
+      const unmatched = new Map(); // key "alias|isoDate" -> {alias, rec}
+      if (store) {
+        Object.keys(store.byAlias).forEach((a) => {
+          store.byAlias[a].forEach((rec) => {
+            const iso = atozDateToISO(rec.request);
+            if (iso) unmatched.set(a + '|' + iso, { alias: a, rec });
+          });
+        });
+      }
+
+      bodyRows.forEach((tr) => {
+        const cells = tr.querySelectorAll(':scope > td');
+        if (!cells.length) return;
+
+        const alias = text(cells[aliasIdx]).toLowerCase();
+        const opsDetails = detailsIdx >= 0 ? text(cells[detailsIdx]) : '';
+
+        let cell = tr.querySelector('.' + NEW_CELL_CLASS);
+        if (!cell) {
+          // Clone a normal body cell to match Cloudscape look, then clear it.
+          const templateCell = cells[cells.length - 1];
+          cell = templateCell.cloneNode(false); // shallow: keep <td> classes only
+          cell.className = templateCell.className + ' ' + NEW_CELL_CLASS;
+          const content = document.createElement('div');
+          content.className = 'awsui_body-cell-content_c6tup_bm66c_24';
+          cell.appendChild(content);
+          tr.appendChild(cell);
+        }
+        const content = cell.querySelector('div') || cell;
+
+        if (!store) {
+          content.textContent = 'AtoZ data not loaded';
+          content.style.color = '#946c00';
+          content.title =
+            'Open the AtoZ manager view and set your date range so the requests load. ' +
+            'This column reads whatever is captured there.';
+          return;
+        }
+
+        const records = alias ? store.byAlias[alias] : null;
+        const label = formatMatch(records, opsDetails);
+
+        // Mark the matched AtoZ entries (this alias + this row's date) as accounted for.
+        const rowDate = (opsDetails.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
+        if (alias && rowDate) unmatched.delete(alias + '|' + rowDate);
+
+        if (label) {
+          content.textContent = label;
+          content.style.color = '';
+          content.style.whiteSpace = 'nowrap';
+          // Full, unabbreviated detail on hover.
+          const full = (records || [])
+            .map((r) => `${r.type} — ${r.request} — ${r.duration} — ${r.status}`)
+            .join('\n');
+          content.title =
+            full + '\n\n(captured from AtoZ ' +
+            new Date(store.capturedAt).toLocaleString() + ')';
+        } else {
+          content.textContent = 'N/A';
+          content.style.color = '#687078';
+          content.title = alias
+            ? `No AtoZ time-off request found for "${alias}" in the captured AtoZ data.`
+            : 'Could not read alias for this row.';
+        }
+      });
+
+      // Anything still in `unmatched` is an AtoZ request with no ops-portal row.
+      renderUnmatchedPanel(store, Array.from(unmatched.values()));
+    }
+
+    // Fixed overlay (pinned to the bottom of the frame) listing AtoZ requests
+    // that have no matching row on the ops portal. Rendered as a self-contained
+    // widget with a hard style reset so page CSS can't mangle it.
+    const PANEL_ID = 'atoz-unmatched-panel';
+    function renderUnmatchedPanel(store, leftovers) {
+      const existing = document.getElementById(PANEL_ID);
+
+      if (!store || !leftovers.length) {
+        if (existing) existing.remove();
+        return;
+      }
+
+      const rows = leftovers
+        .sort((a, b) => a.alias.localeCompare(b.alias))
+        .map((u) => {
+          const code = abbrevType(u.rec.type);
+          const when = compactWhen(u.rec.request);
+          const dur = (u.rec.duration || '').replace(/\s*hours?/i, 'h').replace(/\s+/g, '');
+          return (
+            '<span style="all:unset;display:inline-block;margin:0 12px 0 0;color:#0f1111;font:12px/1.5 Arial,sans-serif;white-space:nowrap">' +
+            '<b style="font-weight:700">' + esc(u.alias) + '</b>' +
+            ' ' + esc(code) + ' · ' + esc(when) + ' · ' + esc(dur) +
+            '</span>'
+          );
+        })
+        .join('');
+
+      // Compact single-strip layout: header + inline items, minimal height.
+      const html =
+        '<div style="all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;' +
+        'box-sizing:border-box;max-height:22vh;overflow:auto;' +
+        'background:#fff8e5;border-top:1px solid #e0a800;' +
+        'box-shadow:0 -1px 6px rgba(0,0,0,.15);padding:5px 12px;' +
+        'font:12px/1.4 Arial,sans-serif;color:#0f1111">' +
+        '<span style="all:unset;font:700 12px/1.4 Arial,sans-serif;color:#8a6d00;margin-right:10px">' +
+        '⚠️ AtoZ not on Ops Portal (' + leftovers.length + '):' +
+        '</span>' +
+        rows +
+        '<span id="' + PANEL_ID + '-close" style="all:unset;cursor:pointer;float:right;' +
+        'font:700 15px/1 Arial;color:#565959;padding:0 4px">×</span>' +
+        '</div>';
+
+      let host = existing;
+      if (!host) {
+        host = document.createElement('div');
+        host.id = PANEL_ID;
+        document.body.appendChild(host);
+      }
+      host.innerHTML = html;
+
+      const closeBtn = document.getElementById(PANEL_ID + '-close');
+      if (closeBtn) closeBtn.addEventListener('click', () => host.remove());
+    }
+
+    // Minimal HTML escape for injected text.
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    const scheduleDecorate = debounce(decorate, 300);
+
+    // Re-decorate on any DOM mutation (paging, filtering, late render).
+    // Observe documentElement so we're covered even before <body> exists.
+    const mo = new MutationObserver(scheduleDecorate);
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+
+    // Re-decorate when the AtoZ tab captures fresh data.
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(STORAGE_KEY, scheduleDecorate);
+    }
+
+    // Poll for a while after load: this SPA renders the table late, after an
+    // auth/userInfo round-trip, and the first mutation may fire before it exists.
+    let tries = 0;
+    const poll = setInterval(() => {
+      tries++;
+      if (findTable() || tries > 60) {
+        clearInterval(poll);
+        log('Ops: poll stopped after', tries, 'tries; table', findTable() ? 'found' : 'NOT found');
+      }
+      decorate();
+    }, 1000);
+
+    scheduleDecorate();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dispatch based on which site we're on
+  // ---------------------------------------------------------------------------
+  log('script loaded on host:', host, '| in iframe:', window.top !== window.self);
+  if (host === 'atoz.amazon.work') {
+    log('-> running AtoZ collector');
+    runAtozCollector();
+  } else if (host === 'my-day.products.annotation.amazon.dev') {
+    // The real time-off table lives here (embedded as an iframe by the ops portal).
+    log('-> running Ops Portal display');
+    runOpsPortalDisplay();
+  } else if (host === 'ads.opsportal.annotation.amazon.dev') {
+    // This is just the outer shell; the table is in the my-day.products iframe.
+    log('-> ops portal shell (no table here); table is in the my-day.products iframe');
+  } else {
+    log('-> host did not match either target; nothing to do');
+  }
+})();
