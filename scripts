@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AtoZ Time-Off on Ops Portal
 // @namespace    https://ads.opsportal.annotation.amazon.dev/
-// @version      1.0.0
-// @description  Scrape DA time-off requests from AtoZ manager view and show them as an extra column on the Ops Portal my-day time-off approval table (matched by alias). Shows N/A when there is no matching AtoZ request.
+// @version      1.14.0
+// @description  Scrape DA time-off requests from AtoZ manager view and show them as an extra column on the Ops Portal my-day time-off approval table (matched by alias), plus a bulk-accept helper that drives the page's own Actions > Accept flow across multiple selected rows.
 // @author       gexu
 // @match        https://atoz.amazon.work/timecard/managerView*
 // @match        https://ads.opsportal.annotation.amazon.dev/app/my-day*
@@ -122,6 +122,11 @@
           log('AtoZ: skipped a row (no alias found). Row text:', text(tr).slice(0, 80));
           return;
         }
+        // Only pull APPROVED requests — skip Pending / Denied / Cancelled / etc.
+        if (!/approved/i.test(rec.status || '')) {
+          log('AtoZ: skipped non-approved row:', rec.alias, '-', rec.status);
+          return;
+        }
         // One alias can have multiple requests — keep them all in a list.
         (byAlias[rec.alias] = byAlias[rec.alias] || []).push(rec);
       });
@@ -162,6 +167,16 @@
     const NEW_COL_ID = 'atoz-request-col';
     const NEW_CELL_CLASS = 'atoz-request-cell';
 
+    // Cache of computed AtoZ labels, keyed by "alias|YYYY-MM-DD". Lets us keep a
+    // previously-good value on screen when a transient re-render (e.g. selecting
+    // a row) briefly makes the row unreadable.
+    const atozLabelCache = new Map();
+
+    // Set of "alias|YYYY-MM-DD" keys that have been matched to an ops-portal row
+    // at any point during the current AtoZ capture. Used so the "not on Ops
+    // Portal" banner stays stable when status filters hide rows.
+    const everMatched = new Set();
+
     function getStore() {
       const raw = GM_getValue(STORAGE_KEY, null);
       return raw && raw.byAlias ? raw : null;
@@ -197,15 +212,17 @@
       const ths = Array.from(table.querySelectorAll('thead th, thead td'));
       let aliasIdx = -1;
       let detailsIdx = -1;
+      let statusIdx = -1;
 
       ths.forEach((th, i) => {
         const fid = th.getAttribute('data-focus-id') || '';
         if (fid === 'header-userAlias') aliasIdx = i;
         if (fid === 'header-duration') detailsIdx = i; // "Time-off or NPT details"
+        if (fid === 'header-status') statusIdx = i;
       });
 
       // Fallback to header text if focus-ids are absent.
-      if (aliasIdx < 0 || detailsIdx < 0) {
+      if (aliasIdx < 0 || detailsIdx < 0 || statusIdx < 0) {
         ths.forEach((th, i) => {
           const t = text(th).toLowerCase();
           if (aliasIdx < 0 && t.includes('associate')) aliasIdx = i;
@@ -215,9 +232,10 @@
           ) {
             detailsIdx = i;
           }
+          if (statusIdx < 0 && t === 'status') statusIdx = i;
         });
       }
-      return { aliasIdx, detailsIdx, colCount: ths.length };
+      return { aliasIdx, detailsIdx, statusIdx, colCount: ths.length };
     }
 
     function formatMatch(records, opsDetails) {
@@ -338,20 +356,445 @@
       });
     }
 
+    // =========================================================================
+    // Bulk Accept
+    // -------------------------------------------------------------------------
+    // The native table only supports single-select (radio) + an "Actions" menu
+    // with Accept/Reject that act on whichever one row is selected. There is no
+    // bulk API visible from the UI, so bulk accept is UI AUTOMATION: for each
+    // row you check, the script (1) clicks that row's native radio to select it,
+    // (2) opens the native "Actions" button, (3) clicks "Accept", (4) waits for
+    // the row to reflect APPROVED, then moves to the next checked row.
+    //
+    // Safety: nothing happens until you click "Accept selected" AND confirm an
+    // explicit list of who/what is about to be accepted. One row at a time,
+    // stops immediately on any error instead of continuing blindly.
+    // =========================================================================
+
+    const selectedRows = new Set(); // tracks <tr> elements the user checked
+
+    // Read the associate alias from the Associate cell, IGNORING the ☐/☑ glyph
+    // we inject into that cell. Without this, the glyph character would be
+    // prepended to the alias on re-render passes and break matching (all N/A).
+    function readAliasFromCell(cell) {
+      if (!cell) return '';
+      // Prefer the phonetool link if present (most stable).
+      const phone = cell.querySelector('a[href*="phonetool.amazon.com/users/"]');
+      if (phone) {
+        const m = phone.getAttribute('href').match(/users\/([^/?#]+)/);
+        if (m) return decodeURIComponent(m[1]).toLowerCase();
+      }
+      // Otherwise clone the cell, drop our glyph, and read the remaining text.
+      const clone = cell.cloneNode(true);
+      clone.querySelectorAll('.atoz-bulk-toggle').forEach((n) => n.remove());
+      let s = text(clone).toLowerCase();
+      // Safety net: strip any stray checkbox glyph chars that survived (✓ ✔ ☑ ☐
+      // ✕ ×) and surrounding whitespace, in case the SPA re-parented our span.
+      s = s.replace(/[\u2713\u2714\u2611\u2610\u2715\u00d7\u2717]/g, '').trim();
+      return s;
+    }
+
+    // Reflect a row's selected state visually (row highlight + the glyph that
+    // sits inside the Associate cell).
+    function paintRowSelection(tr) {
+      const selected = selectedRows.has(tr);
+      const bg = selected ? '#f0f8ff' : '';
+      if (tr.style.background !== bg) tr.style.background = bg;
+      const toggle = tr.querySelector('.atoz-bulk-toggle');
+      if (toggle) {
+        const glyph = selected ? '✓' : '';
+        if (toggle.textContent !== glyph) toggle.textContent = glyph;
+        const bgc = selected ? '#0972d3' : '#ffffff';
+        const bc = selected ? '#0972d3' : '#8d99a8';
+        if (toggle.style.background !== bgc) toggle.style.background = bgc;
+        if (toggle.style.borderColor !== bc) toggle.style.borderColor = bc;
+        if (toggle.style.color !== 'rgb(255, 255, 255)' && toggle.style.color !== '#ffffff') {
+          toggle.style.color = '#ffffff';
+        }
+      }
+    }
+
+    // Decide whether a row is PENDING (and thus bulk-acceptable). Robust against
+    // status-column index drift after filter/sort re-renders: it checks the
+    // detected status cell first, then falls back to scanning the whole row's
+    // text. A row counts as pending ONLY if it mentions PENDING and does not
+    // mention APPROVED / WITHDREW / DENIED / REJECTED / CANCEL.
+    // Returns 'pending', 'other', or 'unknown'. 'unknown' means the row's
+    // status could not be read (e.g. a transient mid-render frame); callers
+    // should NOT hide an already-present checkbox on 'unknown', so filter/paging
+    // re-renders don't permanently strip checkboxes.
+    function rowStatusKind(tr, cells, statusIdx) {
+      const cellStatus =
+        statusIdx >= 0 && cells[statusIdx] ? text(cells[statusIdx]).toUpperCase() : '';
+      const rowStatus = text(tr).toUpperCase();
+      const hay = cellStatus || rowStatus;
+      let kind;
+      if (/\b(APPROVED|WITHDREW|WITHDRAWN|DENIED|REJECTED|CANCEL)/.test(hay)) kind = 'other';
+      else if (/\bPENDING\b/.test(hay)) kind = 'pending';
+      else kind = 'unknown';
+      return kind;
+    }
+
+    // Make PENDING rows selectable WITHOUT adding a column (which would shift
+    // every cell index and break alias/details matching). We inject a clickable
+    // ☐ glyph INSIDE the Associate cell, before the alias text. The cell count
+    // is unchanged, so columnIndexes() stays correct across re-renders.
+    function wireRowSelection(bodyRows, aliasIdx, statusIdx) {
+      let pendingCount = 0;
+      bodyRows.forEach((tr) => {
+        const cells = tr.querySelectorAll(':scope > td');
+        if (!cells.length || aliasIdx < 0 || !cells[aliasIdx]) return;
+
+        const kind = rowStatusKind(tr, cells, statusIdx);
+        const aliasCell = cells[aliasIdx];
+        const content = aliasCell.querySelector('div') || aliasCell;
+
+        // Always ensure the toggle EXISTS on every data row (the SPA destroys
+        // it whenever it re-renders the Associate cell, so we must re-create it
+        // on every pass if missing). Visibility is driven by status below.
+        let toggle = tr.querySelector('.atoz-bulk-toggle');
+        if (!toggle) {
+          toggle = document.createElement('span');
+          toggle.className = 'atoz-bulk-toggle';
+          // Styled to look like a real 16px checkbox.
+          toggle.style.cssText =
+            'display:inline-flex;align-items:center;justify-content:center;' +
+            'width:16px;height:16px;margin-right:9px;box-sizing:border-box;' +
+            'border:2px solid #8d99a8;border-radius:3px;background:#fff;' +
+            'font:700 11px/1 Arial,sans-serif;color:#fff;' +
+            'vertical-align:middle;cursor:pointer;user-select:none;flex:0 0 auto;';
+          content.insertBefore(toggle, content.firstChild);
+        }
+
+        // Wire the click handlers once. We attach in the CAPTURE phase and call
+        // stopImmediatePropagation so the native row/radio selection (a React
+        // listener higher up) never fires — native selection would re-render the
+        // row, wipe our AtoZ cell, and make the selected row flash to N/A.
+        if (!toggle._atozWired) {
+          toggle._atozWired = true;
+          toggle.title = 'Click to select/deselect this row for bulk accept';
+          const toggleTr = () => {
+            if (selectedRows.has(tr)) selectedRows.delete(tr);
+            else selectedRows.add(tr);
+            paintRowSelection(tr);
+            updateBulkActionBar();
+          };
+          const swallow = (e) => {
+            e.stopImmediatePropagation();
+            e.stopPropagation();
+            e.preventDefault();
+          };
+          ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach((ev) =>
+            toggle.addEventListener(ev, swallow, true)
+          );
+          toggle.addEventListener(
+            'click',
+            (e) => {
+              swallow(e);
+              toggleTr();
+            },
+            true
+          );
+        }
+
+        // Visibility: show for PENDING, hide for APPROVED/WITHDREW/etc. For
+        // 'unknown' (transient render), DEFAULT TO SHOWING so a half-rendered
+        // frame never permanently strips the checkbox. The next clean pass will
+        // hide it if the row is actually non-pending.
+        if (kind === 'other') {
+          toggle.style.display = 'none';
+          if (selectedRows.has(tr)) selectedRows.delete(tr);
+        } else {
+          // 'pending' or 'unknown'
+          toggle.style.display = 'inline-flex';
+          if (kind === 'pending') pendingCount++;
+        }
+        paintRowSelection(tr);
+      });
+
+      log('Ops: wired selection on', pendingCount, 'PENDING row(s) of', bodyRows.length,
+          '(statusIdx=', statusIdx, ')');
+
+      // Drop any tracked rows that are no longer in the DOM/table (re-render).
+      Array.from(selectedRows).forEach((tr) => {
+        if (!document.contains(tr)) selectedRows.delete(tr);
+      });
+    }
+
+    const BAR_ID = 'atoz-bulk-action-bar';
+    function ensureBulkActionBar() {
+      if (document.getElementById(BAR_ID)) {
+        updateBulkActionBar();
+        return;
+      }
+      const bar = document.createElement('div');
+      bar.id = BAR_ID;
+      bar.style.cssText =
+        'all:initial;position:fixed;top:16px;right:16px;z-index:2147483647;' +
+        "font-family:'Amazon Ember',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;" +
+        'background:#ffffff;color:#16191f;' +
+        'padding:10px 12px;border:1px solid #d5dbdb;border-radius:10px;' +
+        'box-shadow:0 4px 16px rgba(0,0,0,.18);' +
+        'display:none;align-items:center;gap:10px;';
+      bar.innerHTML =
+        '<span style="all:unset;display:inline-flex;align-items:center;justify-content:center;' +
+        'min-width:22px;height:22px;padding:0 7px;border-radius:11px;background:#0972d3;color:#fff;' +
+        "font:700 12px/1 'Amazon Ember',Arial,sans-serif;\" id=\"atoz-bulk-count\"></span>" +
+        '<span style="all:unset;color:#414750;font:400 13px/1.4 Arial,sans-serif">selected</span>' +
+        '<button id="atoz-bulk-accept-btn" style="all:unset;cursor:pointer;background:#037f0c;' +
+        'color:#fff;font:700 13px/1.4 Arial,sans-serif;padding:7px 14px;border-radius:8px;' +
+        'transition:background .12s;">Accept selected</button>' +
+        '<button id="atoz-bulk-clear-btn" style="all:unset;cursor:pointer;background:#fff;' +
+        'color:#414750;font:400 13px/1.4 Arial,sans-serif;padding:7px 12px;border-radius:8px;' +
+        'border:1px solid #8d99a8;">Clear</button>';
+      document.body.appendChild(bar);
+
+      // Hover affordance for the Accept button.
+      const _acc = bar.querySelector('#atoz-bulk-accept-btn');
+      _acc.addEventListener('mouseenter', () => { if (!_acc.disabled) _acc.style.background = '#026b0a'; });
+      _acc.addEventListener('mouseleave', () => { if (!_acc.disabled) _acc.style.background = '#037f0c'; });
+
+      document.getElementById('atoz-bulk-accept-btn').addEventListener('click', onBulkAcceptClick);
+      document.getElementById('atoz-bulk-clear-btn').addEventListener('click', () => {
+        const rows = Array.from(selectedRows);
+        selectedRows.clear();
+        rows.forEach((tr) => paintRowSelection(tr));
+        updateBulkActionBar();
+      });
+
+      updateBulkActionBar();
+    }
+
+    function updateBulkActionBar() {
+      const bar = document.getElementById(BAR_ID);
+      if (!bar) return;
+      const n = selectedRows.size;
+      bar.style.display = n > 0 ? 'flex' : 'none';
+      const countEl = document.getElementById('atoz-bulk-count');
+      if (countEl) countEl.textContent = String(n);
+    }
+
+    // Read a quick human-readable description of a row for the confirmation step.
+    function describeRow(tr, aliasIdx, detailsIdx) {
+      const cells = tr.querySelectorAll(':scope > td');
+      const alias = aliasIdx >= 0 ? readAliasFromCell(cells[aliasIdx]) : '(unknown)';
+      const details = detailsIdx >= 0 ? text(cells[detailsIdx]) : '';
+      return `${alias} — ${details}`;
+    }
+
+    async function onBulkAcceptClick() {
+      const rows = Array.from(selectedRows);
+      if (!rows.length) return;
+
+      const table = findTable();
+      if (!table) {
+        alert('AtoZ↔Ops: could not find the table — aborting.');
+        return;
+      }
+      const { aliasIdx, detailsIdx } = columnIndexes(table);
+
+      const list = rows.map((tr) => '• ' + describeRow(tr, aliasIdx, detailsIdx)).join('\n');
+      const confirmed = window.confirm(
+        `This will ACCEPT ${rows.length} time-off request(s), one at a time:\n\n${list}\n\n` +
+        `This uses the page's own Actions > Accept action and cannot be undone from here. Continue?`
+      );
+      if (!confirmed) return;
+
+      const bar = document.getElementById(BAR_ID);
+      const btn = document.getElementById('atoz-bulk-accept-btn');
+      if (btn) { btn.disabled = true; btn.style.background = '#8d99a8'; btn.textContent = 'Accepting…'; }
+
+      let okCount = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const tr = rows[i];
+        const label = describeRow(tr, aliasIdx, detailsIdx);
+        if (btn) btn.textContent = `Accepting ${i + 1} of ${rows.length}…`;
+        log('Bulk accept: processing', label);
+        try {
+          await acceptOneRow(tr);
+          okCount++;
+          selectedRows.delete(tr);
+          paintRowSelection(tr);
+        } catch (err) {
+          log('Bulk accept: FAILED on', label, err);
+          alert(
+            `Stopped after accepting ${okCount} of ${rows.length}.\n\n` +
+            `Failed on: ${label}\nReason: ${err.message || err}\n\n` +
+            `Remaining rows were NOT touched — re-select and retry if needed.`
+          );
+          break;
+        }
+      }
+
+      if (btn) {
+        btn.disabled = false;
+        btn.style.background = '#037f0c';
+        btn.textContent = 'Accept selected';
+      }
+      updateBulkActionBar();
+      log('Bulk accept: finished,', okCount, 'of', rows.length, 'succeeded');
+
+      // The accepts re-render the table and replace <tr> nodes, which drops our
+      // injected ☐ glyphs from the OTHER (unselected) rows. Force a couple of
+      // re-decorations so every still-PENDING row gets its checkbox back,
+      // instead of waiting on an observer tick that may not fire.
+      setTimeout(scheduleDecorate, 400);
+      setTimeout(scheduleDecorate, 1200);
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // Wait until `check()` returns truthy, polling every `interval`ms, up to `timeout`ms.
+    async function waitFor(check, timeout, interval) {
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+        const v = check();
+        if (v) return v;
+        await sleep(interval);
+      }
+      throw new Error('Timed out waiting for expected page state.');
+    }
+
+    // Locate the confirmation modal ("Accept request" dialog with a Comments
+    // field) if it is currently open. Returns the dialog element or null.
+    function findAcceptModal() {
+      const dialogs = document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [class*="modal"], [class*="dialog"]'
+      );
+      for (const d of dialogs) {
+        if (d.offsetParent === null && d.getClientRects().length === 0) continue; // not visible
+        const t = text(d).toLowerCase();
+        if (t.includes('accept request') || (t.includes('override') && t.includes('accept'))) {
+          return d;
+        }
+      }
+      return null;
+    }
+
+    // Within a container, find a visible, enabled button whose label matches.
+    function findButton(container, label) {
+      const scope = container || document;
+      return Array.from(scope.querySelectorAll('button')).find((b) => {
+        if (b.offsetParent === null) return false; // hidden
+        if (b.disabled) return false;
+        return text(b).toLowerCase() === label;
+      });
+    }
+
+    // Drive the real UI for one row:
+    //   1) select the row's radio
+    //   2) open the "Actions" menu
+    //   3) click the "Accept" menu item
+    //   4) in the confirmation modal that appears, click its "Accept" button
+    //   5) wait for the modal to close
+    async function acceptOneRow(tr) {
+      const radio = tr.querySelector('input[type="radio"]');
+      if (!radio) throw new Error('No radio control found on this row.');
+
+      radio.click();
+      await sleep(250); // let the app register the selection
+
+      // Find the "Actions" button anywhere on the page (it's outside the table).
+      const actionsBtn = await waitFor(
+        () => Array.from(document.querySelectorAll('button')).find(
+          (b) => text(b).toLowerCase() === 'actions' && b.offsetParent !== null
+        ),
+        4000, 150
+      );
+      actionsBtn.click();
+      await sleep(250); // let the dropdown render
+
+      // Find the "Accept" menu item that just appeared. Restrict to real menu
+      // items so we don't accidentally grab a button inside the (not-yet-open)
+      // modal or elsewhere on the page.
+      const acceptItem = await waitFor(() => {
+        const candidates = document.querySelectorAll(
+          '[role="menuitem"], [role="menuitemradio"], li button, a[role="menuitem"], button'
+        );
+        return Array.from(candidates).find((el) => {
+          const t = text(el).toLowerCase();
+          return t === 'accept' && el.offsetParent !== null && !findAcceptModal();
+        });
+      }, 4000, 150);
+      acceptItem.click();
+
+      // A confirmation modal ("Accept request", with an optional Comments box)
+      // now opens. We must click ITS "Accept" button to actually submit.
+      const modal = await waitFor(() => findAcceptModal(), 5000, 150);
+      await sleep(200); // let the modal finish animating in
+
+      const confirmBtn = await waitFor(
+        () => findButton(modal, 'accept'),
+        4000, 150
+      );
+      confirmBtn.click();
+
+      // After clicking Accept the request IS submitted (a green "submitted
+      // successfully" banner appears), but the modal does NOT close itself —
+      // it stays open until the × / Cancel is clicked. Wait for the success
+      // signal, then dismiss the modal ourselves.
+      await waitFor(() => {
+        const m = findAcceptModal();
+        if (!m) return true; // already gone
+        return /submitted successfully|success/i.test(text(m));
+      }, 8000, 200);
+
+      // If the modal is still open, close it (prefer the × button, else Cancel).
+      let modalNow = findAcceptModal();
+      if (modalNow) {
+        const closeBtn = findModalCloseButton(modalNow) || findButton(modalNow, 'cancel');
+        if (closeBtn) {
+          closeBtn.click();
+          // Confirm it actually closed.
+          await waitFor(() => findAcceptModal() === null, 4000, 150);
+        }
+      }
+
+      // Give the app time to process and re-render the row's status.
+      await sleep(600);
+    }
+
+    // Find the modal's close control: the "×" icon button in the HEADER.
+    // We must avoid the × on the green success/alert banner (which only
+    // dismisses the banner, not the modal). So we skip any button that sits
+    // inside an alert/flashbar region.
+    function findModalCloseButton(modal) {
+      if (!modal) return null;
+      const inAlert = (el) =>
+        !!el.closest('[role="alert"], [role="status"], [class*="flash"], [class*="alert"], [class*="notification"]');
+
+      const buttons = Array.from(modal.querySelectorAll('button, [role="button"]'))
+        .filter((b) => b.offsetParent !== null && !inAlert(b));
+
+      // Prefer an explicit close label.
+      let btn = buttons.find((b) => {
+        const label = (b.getAttribute('aria-label') || b.getAttribute('title') || '').toLowerCase();
+        return label === 'close' || label.includes('close') || label.includes('dismiss');
+      });
+      if (btn) return btn;
+
+      // Else a button whose visible text is just the × glyph.
+      btn = buttons.find((b) => {
+        const t = text(b);
+        return t === '×' || t === '✕' || t === 'X' || t === '\u2715' || t === '\u00d7';
+      });
+      return btn || null;
+    }
+
     function decorate() {
       const table = findTable();
       if (!table) {
         // Quiet: this fires repeatedly while the SPA is still rendering.
         return;
       }
-      log('Ops: table located.');
       const store = getStore();
-      log('Ops: store from GM_getValue =', store);
 
       ensureHeaderCell(table);
 
-      const { aliasIdx, detailsIdx, colCount } = columnIndexes(table);
-      log('Ops: aliasIdx=', aliasIdx, 'detailsIdx=', detailsIdx, 'colCount=', colCount);
+      const { aliasIdx, detailsIdx, statusIdx, colCount } = columnIndexes(table);
+      log('Ops: aliasIdx=', aliasIdx, 'detailsIdx=', detailsIdx, 'statusIdx=', statusIdx, 'colCount=', colCount);
       if (aliasIdx < 0) {
         log('Ops: could not locate Associate column, aborting.');
         return;
@@ -388,8 +831,63 @@
         log('Ops: found', bodyRows.length, 'body row(s)');
       }
 
+      // CHANGE-DETECTION GUARD. The observer can fire many times per second on
+      // this live dashboard. Without this, decorate() keeps rewriting the DOM
+      // and the page visibly flashes/blinks. Build a signature from NATIVE row
+      // data only (alias + the native cells, EXCLUDING our injected AtoZ column
+      // and ☐ glyph), plus the capture time. If unchanged since the last pass,
+      // bail out — the DOM is already correct. Selection highlight is applied
+      // directly by the click handler, so this early return never makes the
+      // checkboxes feel unresponsive.
+      // "decorated" = how many rows already carry our injected AtoZ cell. If the
+      // SPA replaced rows with fresh nodes (same text, but our injections gone),
+      // this count drops and the signature changes, forcing a re-decorate.
+      const decoratedCount = bodyRows.filter(
+        (tr) => tr.querySelector('.' + NEW_CELL_CLASS)
+      ).length;
+      const sig =
+        (store ? store.capturedAt : 'nostore') + '::' + bodyRows.length +
+        '::dec' + decoratedCount + '::' +
+        bodyRows
+          .map((tr) => {
+            const cs = tr.querySelectorAll(':scope > td');
+            const a = aliasIdx >= 0 && cs[aliasIdx] ? readAliasFromCell(cs[aliasIdx]) : '';
+            const d = detailsIdx >= 0 && cs[detailsIdx] ? text(cs[detailsIdx]) : '';
+            const s = statusIdx >= 0 && cs[statusIdx] ? text(cs[statusIdx]) : '';
+            return a + '~' + d + '~' + s;
+          })
+          .join('|');
+      if (sig === decorate._lastSig) {
+        return; // nothing relevant changed — skip the whole pass (no flashing)
+      }
+      decorate._lastSig = sig;
+
+      // When the capture OR the row set changes (e.g. filtering reorders rows),
+      // the position-based cache is no longer valid — clear it so stale values
+      // can't appear on the wrong row. The cell dataset + a fresh match rebuild
+      // it immediately below.
+      const capNow = (store ? store.capturedAt : 'nostore') + '::' + bodyRows.length;
+      if (atozLabelCache._capTag !== capNow) {
+        atozLabelCache.clear();
+        atozLabelCache._capTag = capNow;
+      }
+      log('Ops: content changed — decorating', bodyRows.length, 'row(s).');
+
       // Hide Paycode to make room for the AtoZ Request column.
       hidePaycodeColumn(table, bodyRows);
+
+      // The bulk-accept action bar (floating top-right). Row selection is wired
+      // up AFTER the AtoZ cells are created, below, because selection lives on
+      // those cells.
+      ensureBulkActionBar();
+
+      // Reset the "ever matched" set when the capture changes, so matches from a
+      // previous capture don't suppress banner entries for a new one.
+      const everCapId = store ? String(store.capturedAt) : 'nostore';
+      if (everMatched._capId !== everCapId) {
+        everMatched.clear();
+        everMatched._capId = everCapId;
+      }
 
       // Track which AtoZ entries (alias + date) get matched to an ops row, so we
       // can list the leftovers (AtoZ requests with no ops-portal counterpart).
@@ -398,16 +896,21 @@
         Object.keys(store.byAlias).forEach((a) => {
           store.byAlias[a].forEach((rec) => {
             const iso = atozDateToISO(rec.request);
-            if (iso) unmatched.set(a + '|' + iso, { alias: a, rec });
+            // Skip anything we've already matched to an ops row at any point this
+            // capture — otherwise toggling a status filter (which hides rows)
+            // would wrongly re-list those as "not on Ops Portal".
+            if (iso && !everMatched.has(a + '|' + iso)) {
+              unmatched.set(a + '|' + iso, { alias: a, rec });
+            }
           });
         });
       }
 
-      bodyRows.forEach((tr) => {
+      bodyRows.forEach((tr, rowIndex) => {
         const cells = tr.querySelectorAll(':scope > td');
         if (!cells.length) return;
 
-        const alias = text(cells[aliasIdx]).toLowerCase();
+        const alias = readAliasFromCell(cells[aliasIdx]);
         const opsDetails = detailsIdx >= 0 ? text(cells[detailsIdx]) : '';
 
         let cell = tr.querySelector('.' + NEW_CELL_CLASS);
@@ -433,31 +936,71 @@
         }
 
         const records = alias ? store.byAlias[alias] : null;
-        const label = formatMatch(records, opsDetails);
-
-        // Mark the matched AtoZ entries (this alias + this row's date) as accounted for.
+        const computed = formatMatch(records, opsDetails);
+        let label = computed;
         const rowDate = (opsDetails.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
+
+        // STICKY VALUE on the cell element. The native selection re-renders the
+        // row and can momentarily make alias/details unreadable, which would
+        // flip a good value to N/A. We remember the last good label on the cell
+        // (and the store capture it belongs to). If a later pass fails to match
+        // while the SAME store capture is in effect, we KEEP the good value
+        // rather than overwriting with N/A. A new AtoZ capture clears it.
+        const capId = String(store.capturedAt);
+        // Position-based cache key survives even if the AtoZ cell is destroyed
+        // and recreated by a native row re-render (dataset would be lost).
+        const posKey = capId + '#' + rowIndex;
+        if (label) {
+          cell.dataset.atozLabel = label;
+          cell.dataset.atozCap = capId;
+          atozLabelCache.set(posKey, label);
+        } else {
+          // No match this pass. Recover a good value from the current capture:
+          // first from the cell's own dataset, then from the position cache.
+          if (cell.dataset.atozLabel && cell.dataset.atozCap === capId) {
+            label = cell.dataset.atozLabel;
+          } else if (atozLabelCache.has(posKey)) {
+            label = atozLabelCache.get(posKey);
+            cell.dataset.atozLabel = label;
+            cell.dataset.atozCap = capId;
+          }
+        }
+
+        // Record a genuine match (computed this pass) so this alias+date is
+        // never later listed in the banner, even if a filter hides the row.
+        if (computed && alias && rowDate) everMatched.add(alias + '|' + rowDate);
+
+        // Mark the matched AtoZ entries (this alias + this row's date) as
+        // accounted for in THIS pass's banner list.
         if (alias && rowDate) unmatched.delete(alias + '|' + rowDate);
 
         if (label) {
-          content.textContent = label;
+          // Only write if changed, so repeated decorate passes don't flash.
+          if (content.textContent !== label) content.textContent = label;
           content.style.color = '';
           content.style.whiteSpace = 'nowrap';
           // Full, unabbreviated detail on hover.
           const full = (records || [])
             .map((r) => `${r.type} — ${r.request} — ${r.duration} — ${r.status}`)
             .join('\n');
-          content.title =
+          const titleText =
             full + '\n\n(captured from AtoZ ' +
             new Date(store.capturedAt).toLocaleString() + ')';
+          if (content.title !== titleText) content.title = titleText;
         } else {
-          content.textContent = 'N/A';
+          if (content.textContent !== 'N/A') content.textContent = 'N/A';
           content.style.color = '#687078';
-          content.title = alias
+          const titleText = alias
             ? `No AtoZ time-off request found for "${alias}" in the captured AtoZ data.`
             : 'Could not read alias for this row.';
+          if (content.title !== titleText) content.title = titleText;
         }
       });
+
+      // Make PENDING rows multi-selectable via a ☐ glyph inside the Associate
+      // cell (no extra column, so cell indices stay intact).
+      wireRowSelection(bodyRows, aliasIdx, statusIdx);
+      updateBulkActionBar();
 
       // Anything still in `unmatched` is an AtoZ request with no ops-portal row.
       renderUnmatchedPanel(store, Array.from(unmatched.values()));
@@ -467,13 +1010,43 @@
     // that have no matching row on the ops portal. Rendered as a self-contained
     // widget with a hard style reset so page CSS can't mangle it.
     const PANEL_ID = 'atoz-unmatched-panel';
+    // Dismiss is sticky: once the user closes the banner, it stays closed until
+    // the AtoZ data is re-captured (store.capturedAt changes). We key the
+    // dismissal to capturedAt so a fresh capture brings the banner back, but
+    // transient re-renders (filter toggles, paging) never resurrect it.
+    let panelSig = '';
+    let panelDismissed = false;        // user clicked × — stay closed
+    let panelDismissedCapture = null;  // which capture it was dismissed for
     function renderUnmatchedPanel(store, leftovers) {
       const existing = document.getElementById(PANEL_ID);
 
       if (!store || !leftovers.length) {
         if (existing) existing.remove();
+        panelSig = '';
         return;
       }
+
+      // A fresh AtoZ capture re-enables the banner.
+      if (panelDismissed && panelDismissedCapture !== store.capturedAt) {
+        panelDismissed = false;
+      }
+
+      // Sticky dismissal: once closed, do nothing on every subsequent pass
+      // (don't remove-and-recreate), which is what caused the blinking.
+      if (panelDismissed) {
+        if (existing) existing.remove();
+        return;
+      }
+
+      const sig = leftovers
+        .map((u) => u.alias + '|' + atozDateToISO(u.rec.request))
+        .sort()
+        .join(',');
+
+      // Content unchanged and panel already present — nothing to do (prevents
+      // the rebuild-on-every-pass churn that broke the close button).
+      if (sig === panelSig && existing) return;
+      panelSig = sig;
 
       const rows = leftovers
         .sort((a, b) => a.alias.localeCompare(b.alias))
@@ -514,7 +1087,13 @@
       host.innerHTML = html;
 
       const closeBtn = document.getElementById(PANEL_ID + '-close');
-      if (closeBtn) closeBtn.addEventListener('click', () => host.remove());
+      if (closeBtn) {
+        closeBtn.addEventListener('click', () => {
+          panelDismissed = true;
+          panelDismissedCapture = store ? store.capturedAt : null;
+          host.remove();
+        });
+      }
     }
 
     // Minimal HTML escape for injected text.
@@ -525,28 +1104,74 @@
         .replace(/>/g, '&gt;');
     }
 
-    const scheduleDecorate = debounce(decorate, 300);
+    // The observer must NOT react to decorate()'s own DOM writes, or it loops
+    // forever (which thrashed selection and resurrected the closed banner).
+    // We disconnect the observer for the duration of each decorate() call and
+    // reconnect afterwards.
+    let mo = null;
+    let decorateErrLogged = false;
+    function safeDecorate() {
+      if (mo) mo.disconnect();
+      try {
+        decorate();
+      } catch (err) {
+        if (!decorateErrLogged) {
+          decorateErrLogged = true;
+          console.error('[AtoZ↔Ops] decorate() threw:', err);
+        }
+      } finally {
+        if (mo) mo.observe(document.documentElement, { childList: true, subtree: true });
+      }
+    }
+    const scheduleDecorate = debounce(safeDecorate, 250);
 
     // Re-decorate on any DOM mutation (paging, filtering, late render).
     // Observe documentElement so we're covered even before <body> exists.
-    const mo = new MutationObserver(scheduleDecorate);
+    mo = new MutationObserver(scheduleDecorate);
     mo.observe(document.documentElement, { childList: true, subtree: true });
 
-    // Re-decorate when the AtoZ tab captures fresh data.
+    // Re-decorate when the AtoZ tab captures fresh data. Two mechanisms:
+    //   (a) GM_addValueChangeListener — instant, but can be unreliable across a
+    //       separate-tab -> iframe boundary (the Ops table is in an iframe).
+    //   (b) A capture-timestamp poller — guaranteed fallback. Every 1.5s it
+    //       reads the stored capturedAt; if it changed since last seen, it
+    //       forces a re-decorate. This is what makes the Ops side auto-update
+    //       when you change the date range / data on the AtoZ tab without
+    //       touching the Ops tab.
     if (typeof GM_addValueChangeListener === 'function') {
-      GM_addValueChangeListener(STORAGE_KEY, scheduleDecorate);
+      GM_addValueChangeListener(STORAGE_KEY, (name, oldVal, newVal) => {
+        log('Ops: AtoZ store changed (value-change listener) — refreshing.');
+        // Force a decorate even if the native table text is unchanged.
+        decorate._lastSig = null;
+        scheduleDecorate();
+      });
     }
 
-    // Poll for a while after load: this SPA renders the table late, after an
-    // auth/userInfo round-trip, and the first mutation may fire before it exists.
+    let lastSeenCapture = null;
+    setInterval(() => {
+      const raw = GM_getValue(STORAGE_KEY, null);
+      const cap = raw && raw.capturedAt ? raw.capturedAt : null;
+      if (cap !== lastSeenCapture) {
+        lastSeenCapture = cap;
+        log('Ops: detected new AtoZ capture via poll (capturedAt=', cap, ') — refreshing.');
+        decorate._lastSig = null; // bypass the no-change guard so the column refreshes
+        scheduleDecorate();
+      }
+    }, 1500);
+
+    // Poll ONLY until the table first appears (this SPA renders it late after an
+    // auth round-trip). Once found, stop — the MutationObserver takes over.
+    // Polling must go through safeDecorate (observer-suppressed) and must not
+    // keep firing afterwards, or it causes periodic flashing.
     let tries = 0;
     const poll = setInterval(() => {
       tries++;
-      if (findTable() || tries > 60) {
+      const found = findTable();
+      if (found || tries > 60) {
         clearInterval(poll);
-        log('Ops: poll stopped after', tries, 'tries; table', findTable() ? 'found' : 'NOT found');
+        log('Ops: poll stopped after', tries, 'tries; table', found ? 'found' : 'NOT found');
       }
-      decorate();
+      safeDecorate();
     }, 1000);
 
     scheduleDecorate();
