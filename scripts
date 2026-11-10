@@ -137,11 +137,23 @@
     // range and it re-renders), scrape and store. To avoid a write loop from the
     // SPA's constant DOM churn, only store when the scraped data actually changed.
     let lastSignature = '';
-    const capture = debounce(() => {
-      const data = scrapeAll();
-      const count = Object.keys(data).length;
-      if (count === 0) return; // don't clobber good data with an empty scrape mid-render
+    let emptyCaptureTimer = null;
+    let emptyCandidateSignature = null;
 
+    function tableStateSignature() {
+      const rows = Array.from(
+        document.querySelectorAll('tr[data-test-component="StencilTableRow"]')
+      );
+      return JSON.stringify(rows.map((tr) => text(tr)));
+    }
+
+    function tableIsLoading() {
+      return Boolean(document.querySelector(
+        '[aria-busy="true"], [role="progressbar"], [data-test-component*="Loading"]'
+      ));
+    }
+
+    function storeCapture(data, count) {
       const signature = JSON.stringify(data);
       if (signature === lastSignature) return; // unchanged — skip
       lastSignature = signature;
@@ -152,7 +164,64 @@
         byAlias: data,
       });
       log('AtoZ: auto-captured', count, 'associate(s):', data);
+    }
+
+    function confirmEmptyCapture(signature) {
+      emptyCaptureTimer = null;
+      if (signature !== emptyCandidateSignature) return;
+
+      // A date change can briefly clear the table while its request is loading.
+      // Wait for that transient state instead of replacing a good capture.
+      if (tableIsLoading()) {
+        emptyCaptureTimer = setTimeout(() => confirmEmptyCapture(signature), 500);
+        return;
+      }
+
+      const currentSignature = tableStateSignature();
+      if (currentSignature !== signature) {
+        capture();
+        return;
+      }
+
+      const data = scrapeAll();
+      if (Object.keys(data).length !== 0) {
+        capture();
+        return;
+      }
+
+      // The table has remained unchanged and is no longer loading, so this is a
+      // settled no-approved-requests result. Publish an empty snapshot so the
+      // previous date's requests cannot remain visible in Ops Portal.
+      storeCapture(data, 0);
+    }
+
+    function scheduleEmptyCapture(signature) {
+      emptyCandidateSignature = signature;
+      if (emptyCaptureTimer) clearTimeout(emptyCaptureTimer);
+      emptyCaptureTimer = setTimeout(() => confirmEmptyCapture(signature), 1000);
+    }
+
+    const capture = debounce(() => {
+      const data = scrapeAll();
+      const count = Object.keys(data).length;
+      if (count === 0) {
+        scheduleEmptyCapture(tableStateSignature());
+        return;
+      }
+
+      if (emptyCaptureTimer) {
+        clearTimeout(emptyCaptureTimer);
+        emptyCaptureTimer = null;
+      }
+      emptyCandidateSignature = null;
+      storeCapture(data, count);
     }, 800);
+
+    // Some date-picker implementations update the table from an input/change
+    // event without producing a child-list mutation. Schedule the same capture
+    // for those events so changing the AtoZ request date refreshes shared data.
+    document.addEventListener('input', capture, true);
+    document.addEventListener('change', capture, true);
 
     // Watch for table renders (initial load + every date-range change).
     const mo = new MutationObserver(capture);
@@ -169,7 +238,8 @@
 
     // Cache of computed AtoZ labels, keyed by "alias|YYYY-MM-DD". Lets us keep a
     // previously-good value on screen when a transient re-render (e.g. selecting
-    // a row) briefly makes the row unreadable.
+    // a row) briefly makes the row unreadable. Each cached value also keeps the
+    // matched request date so a real date change cannot reuse an old label.
     const atozLabelCache = new Map();
 
     // Set of "alias|YYYY-MM-DD" keys that have been matched to an ops-portal row
@@ -238,19 +308,23 @@
       return { aliasIdx, detailsIdx, statusIdx, colCount: ths.length };
     }
 
-    function formatMatch(records, opsDetails) {
-      if (!records || !records.length) return null;
+    function matchingRecords(records, opsDetails) {
+      if (!records || !records.length) return [];
 
-      // Date-only matching: show an AtoZ request ONLY if the associate has one on
-      // the same calendar date as the ops-portal row. Otherwise return null (N/A).
-      // (Times are intentionally not compared — the two systems report different
-      // clock times for the same request due to a timezone offset.)
       const opsDate = (opsDetails.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
-      if (!opsDate) return null; // no date to match against
+      if (!opsDate) return []; // no date to match against
 
-      const chosen = records.filter((r) => atozDateToISO(r.request) === opsDate);
+      return records.filter((r) => atozDateToISO(r.request) === opsDate);
+    }
+
+    function formatMatch(records, opsDetails) {
+      const chosen = matchingRecords(records, opsDetails);
       if (!chosen.length) return null; // no AtoZ request on that date -> N/A
 
+      // Date-only matching: show an AtoZ request ONLY if the associate has one on
+      // the same calendar date as the ops-portal row. Times are intentionally not
+      // compared because the two systems report different clock times for the
+      // same request due to a timezone offset.
       return chosen
         .map((r) => {
           const code = abbrevType(r.type);
@@ -936,6 +1010,7 @@
         }
 
         const records = alias ? store.byAlias[alias] : null;
+        const matchedRecords = matchingRecords(records, opsDetails);
         const computed = formatMatch(records, opsDetails);
         let label = computed;
         const rowDate = (opsDetails.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
@@ -945,7 +1020,8 @@
         // flip a good value to N/A. We remember the last good label on the cell
         // (and the store capture it belongs to). If a later pass fails to match
         // while the SAME store capture is in effect, we KEEP the good value
-        // rather than overwriting with N/A. A new AtoZ capture clears it.
+        // rather than overwriting with N/A. A real date change must not recover
+        // the old label, even when the AtoZ capture is unchanged.
         const capId = String(store.capturedAt);
         // Position-based cache key survives even if the AtoZ cell is destroyed
         // and recreated by a native row re-render (dataset would be lost).
@@ -953,16 +1029,27 @@
         if (label) {
           cell.dataset.atozLabel = label;
           cell.dataset.atozCap = capId;
-          atozLabelCache.set(posKey, label);
+          cell.dataset.atozDate = rowDate;
+          atozLabelCache.set(posKey, { label, rowDate });
         } else {
           // No match this pass. Recover a good value from the current capture:
           // first from the cell's own dataset, then from the position cache.
-          if (cell.dataset.atozLabel && cell.dataset.atozCap === capId) {
+          // If the row now has a different date, leave it as N/A.
+          const cachedDate = cell.dataset.atozDate || '';
+          if (
+            cell.dataset.atozLabel &&
+            cell.dataset.atozCap === capId &&
+            (!rowDate || cachedDate === rowDate)
+          ) {
             label = cell.dataset.atozLabel;
           } else if (atozLabelCache.has(posKey)) {
-            label = atozLabelCache.get(posKey);
-            cell.dataset.atozLabel = label;
-            cell.dataset.atozCap = capId;
+            const cached = atozLabelCache.get(posKey);
+            if (!rowDate || cached.rowDate === rowDate) {
+              label = cached.label;
+              cell.dataset.atozLabel = label;
+              cell.dataset.atozCap = capId;
+              cell.dataset.atozDate = cached.rowDate;
+            }
           }
         }
 
@@ -979,8 +1066,8 @@
           if (content.textContent !== label) content.textContent = label;
           content.style.color = '';
           content.style.whiteSpace = 'nowrap';
-          // Full, unabbreviated detail on hover.
-          const full = (records || [])
+          // Full, unabbreviated detail for only the exact matching request on hover.
+          const full = matchedRecords
             .map((r) => `${r.type} — ${r.request} — ${r.duration} — ${r.status}`)
             .join('\n');
           const titleText =
@@ -1124,6 +1211,16 @@
       }
     }
     const scheduleDecorate = debounce(safeDecorate, 250);
+
+    // Date controls can update their value without changing the table DOM. Force
+    // a fresh match when the Ops Portal request date changes so the row does not
+    // retain the previous date's AtoZ label.
+    const refreshForDateChange = () => {
+      decorate._lastSig = null;
+      scheduleDecorate();
+    };
+    document.addEventListener('input', refreshForDateChange, true);
+    document.addEventListener('change', refreshForDateChange, true);
 
     // Re-decorate on any DOM mutation (paging, filtering, late render).
     // Observe documentElement so we're covered even before <body> exists.
