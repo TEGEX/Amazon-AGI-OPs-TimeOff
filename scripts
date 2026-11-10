@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AtoZ Time-Off on Ops Portal
 // @namespace    https://ads.opsportal.annotation.amazon.dev/
-// @version      1.14.0
+// @version      1.14.1
 // @description  Scrape DA time-off requests from AtoZ manager view and show them as an extra column on the Ops Portal my-day time-off approval table (matched by alias), plus a bulk-accept helper that drives the page's own Actions > Accept flow across multiple selected rows.
 // @author       gexu
 // @match        https://atoz.amazon.work/timecard/managerView*
